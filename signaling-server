@@ -1,0 +1,12 @@
+{
+  "name": "signaling-server",
+  "version": "1.0.0",
+  "description": "Serveur de signalisation WebRTC pour contrôle à distance entre deux appareils personnels",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
