@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Contrôle à distance</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: #0a0a0a; color: #eee;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  #statusBar {
+    position: fixed; top: 0; left: 0; right: 0;
+    padding: 10px 16px; font-size: 14px;
+    background: rgba(0,0,0,0.6);
+    z-index: 10;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  #videoWrap {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    touch-action: none;
+  }
+  #remoteVideo {
+    max-width: 100%; max-height: 100%;
+    touch-action: none;
+  }
+  #centerMessage {
+    position: absolute; text-align: center; padding: 24px;
+    font-size: 16px; color: #aaa; max-width: 320px;
+  }
+  #reconnectDot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #e33; display: inline-block; margin-right: 6px;
+  }
+  #reconnectDot.connected { background: #3c3; }
+  .navBtn {
+    position: fixed; bottom: 20px;
+    background: rgba(255,255,255,0.12);
+    border: none; border-radius: 50%;
+    width: 52px; height: 52px;
+    color: white; font-size: 20px;
+    display: flex; align-items: center; justify-content: center;
+    z-index: 10;
+  }
+  #backBtn { left: 20px; }
+  #homeBtn { left: 50%; transform: translateX(-50%); }
+  #recentsBtn { right: 20px; }
+</style>
+</head>
+<body>
+
+<div id="statusBar">
+  <span><span id="reconnectDot"></span><span id="statusText">Connexion…</span></span>
+  <span id="codeLabel"></span>
+</div>
+
+<div id="videoWrap">
+  <div id="centerMessage">En attente de l'écran distant…</div>
+  <video id="remoteVideo" autoplay playsinline></video>
+</div>
+
+<button class="navBtn" id="backBtn">←</button>
+<button class="navBtn" id="homeBtn">●</button>
+<button class="navBtn" id="recentsBtn">▢</button>
+
+<script>
+const params = new URLSearchParams(window.location.search);
+const CODE = params.get('code');
+
+const AUTO_SERVER_URL = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host;
+const SERVER_URL = params.get('server') || AUTO_SERVER_URL;
+
+const statusText = document.getElementById('statusText');
+const reconnectDot = document.getElementById('reconnectDot');
+const codeLabel = document.getElementById('codeLabel');
+const centerMessage = document.getElementById('centerMessage');
+const remoteVideo = document.getElementById('remoteVideo');
+
+let ws = null;
+let pc = null;
+let dataChannel = null;
+let remoteScreenWidth = 0;
+let remoteScreenHeight = 0;
+
+if (!CODE) {
+  centerMessage.textContent = "Lien invalide : code de session manquant.";
+} else {
+  codeLabel.textContent = CODE;
+  connect();
+}
+
+function setStatus(text, connected) {
+  statusText.textContent = text;
+  reconnectDot.classList.toggle('connected', !!connected);
+}
+
+function connect() {
+  setStatus('Connexion au serveur…', false);
+  ws = new WebSocket(SERVER_URL);
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'controller-join-session', code: CODE }));
+  };
+
+  ws.onmessage = async (event) => {
+    const msg = JSON.parse(event.data);
+
+    switch (msg.type) {
+      case 'joined-session':
+        setStatus('En attente de l\'écran…', false);
+        sessionStorage.setItem('controllerToken', msg.controllerToken);
+        setupPeerConnection();
+        break;
+
+      case 'signal':
+        await handleSignal(msg.data);
+        break;
+
+      case 'peer-disconnected':
+        setStatus('Appareil distant déconnecté', false);
+        centerMessage.style.display = 'block';
+        centerMessage.textContent = "L'autre appareil s'est déconnecté.";
+        break;
+
+      case 'session-ended':
+      case 'session-expired':
+        setStatus('Session terminée', false);
+        centerMessage.style.display = 'block';
+        centerMessage.textContent = "Cette session a expiré. Redemande un lien.";
+        break;
+
+      case 'error':
+        setStatus('Erreur : ' + msg.message, false);
+        break;
+    }
+  };
+
+  ws.onclose = () => setStatus('Déconnecté du serveur', false);
+  ws.onerror = () => setStatus('Erreur de connexion', false);
+}
+
+function setupPeerConnection() {
+  pc = new RTCPeerConnection({
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' }
+    ]
+  });
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      sendSignal({
+        kind: 'ice-candidate',
+        sdpMid: event.candidate.sdpMid,
+        sdpMLineIndex: event.candidate.sdpMLineIndex,
+        candidate: event.candidate.candidate
+      });
+    }
+  };
+
+  pc.ontrack = (event) => {
+    remoteVideo.srcObject = event.streams[0];
+    centerMessage.style.display = 'none';
+    setStatus('Connecté', true);
+
+    remoteVideo.onloadedmetadata = () => {
+      remoteScreenWidth = remoteVideo.videoWidth;
+      remoteScreenHeight = remoteVideo.videoHeight;
+    };
+  };
+
+  pc.ondatachannel = (event) => {
+    dataChannel = event.channel;
+    setupDataChannel();
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'connected') setStatus('Connecté', true);
+    if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
+      setStatus('Connexion perdue', false);
+    }
+  };
+}
+
+function setupDataChannel() {
+  dataChannel.onopen = () => console.log('DataChannel ouvert');
+  dataChannel.onclose = () => console.log('DataChannel fermé');
+}
+
+async function handleSignal(data) {
+  if (data.kind === 'offer') {
+    await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    sendSignal({ kind: 'answer', sdp: answer.sdp });
+  } else if (data.kind === 'ice-candidate') {
+    try {
+      await pc.addIceCandidate({
+        sdpMid: data.sdpMid,
+        sdpMLineIndex: data.sdpMLineIndex,
+        candidate: data.candidate
+      });
+    } catch (e) {
+      console.warn('Échec ajout ICE candidate', e);
+    }
+  }
+}
+
+function sendSignal(data) {
+  ws.send(JSON.stringify({ type: 'signal', data }));
+}
+
+function sendCommand(command) {
+  if (dataChannel && dataChannel.readyState === 'open') {
+    dataChannel.send(JSON.stringify(command));
+  }
+}
+
+function videoToRemoteCoords(clientX, clientY) {
+  const rect = remoteVideo.getBoundingClientRect();
+  const relX = (clientX - rect.left) / rect.width;
+  const relY = (clientY - rect.top) / rect.height;
+  return {
+    x: Math.round(relX * (remoteScreenWidth || rect.width)),
+    y: Math.round(relY * (remoteScreenHeight || rect.height))
+  };
+}
+
+let touchStart = null;
+let touchStartTime = 0;
+
+remoteVideo.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  const t = e.touches[0];
+  touchStart = videoToRemoteCoords(t.clientX, t.clientY);
+  touchStartTime = Date.now();
+}, { passive: false });
+
+remoteVideo.addEventListener('touchend', (e) => {
+  e.preventDefault();
+  if (!touchStart) return;
+  const t = e.changedTouches[0];
+  const end = videoToRemoteCoords(t.clientX, t.clientY);
+  const duration = Date.now() - touchStartTime;
+  const dist = Math.hypot(end.x - touchStart.x, end.y - touchStart.y);
+
+  if (dist < 12) {
+    sendCommand({ action: 'tap', x: touchStart.x, y: touchStart.y });
+  } else {
+    sendCommand({
+      action: 'swipe',
+      x1: touchStart.x, y1: touchStart.y,
+      x2: end.x, y2: end.y,
+      durationMs: Math.max(duration, 100)
+    });
+  }
+  touchStart = null;
+}, { passive: false });
+
+remoteVideo.addEventListener('click', (e) => {
+  const coords = videoToRemoteCoords(e.clientX, e.clientY);
+  sendCommand({ action: 'tap', x: coords.x, y: coords.y });
+});
+
+document.getElementById('backBtn').addEventListener('click', () => sendCommand({ action: 'back' }));
+document.getElementById('homeBtn').addEventListener('click', () => sendCommand({ action: 'home' }));
+document.getElementById('recentsBtn').addEventListener('click', () => sendCommand({ action: 'recents' }));
+
+</script>
+</body>
+</html>
